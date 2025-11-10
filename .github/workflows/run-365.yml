@@ -1,45 +1,134 @@
-name: 运行 365.py 并上传 success_results.txt
+name: Run 365.py for all txt files
 
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
-  run-script:
+  prepare-input:
     runs-on: ubuntu-latest
-
     steps:
-      - name: 拉取代码
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - name: 设置 Python 环境
-        uses: actions/setup-python@v4
+      - name: Unzip any zip file and flatten
+        run: |
+          mkdir -p input
+          mkdir -p input_temp
+          zip_file=$(ls *.zip | head -n 1)
+          echo "Detected zip file: $zip_file"
+          unzip -o "$zip_file" -d input_temp
+          # 扁平化：将所有 txt 移动到 input 根目录
+          find input_temp -type f -name "*.txt" -exec mv {} input/ \;
+          rm -rf input_temp
+          ls -R input  # 可选调试
+
+      - name: Upload input files as artifact
+        uses: actions/upload-artifact@v4
         with:
-          python-version: "3.10"
+          name: input-txt
+          path: input/
 
-      - name: 安装依赖
+  discover-files:
+    needs: prepare-input
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - name: Download input artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: input-txt
+          path: input/
+
+      - name: Find all txt files
+        id: set
         run: |
-          pip install -r requirements.txt || true
+          files=$(find input -type f -name "*.txt" | jq -R -s -c 'split("\n")[:-1]')
+          echo "Found files: $files"
+          echo "matrix={\"file\":$files}" >> $GITHUB_OUTPUT
 
-      - name: 运行 365.py
-        run: python 365.py
+  run-script:
+    needs: discover-files
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJSON(needs.discover-files.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: 重命名并移动 success_results.txt 到 outputs/
+      - name: Download input artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: input-txt
+          path: input/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Prepare mail.txt and run script
         run: |
-          mkdir -p outputs
-          timestamp=$(date +"%Y-%m-%d_%H-%M")
-          if [ -f success_results.txt ]; then
-            mv success_results.txt outputs/success_${timestamp}.txt
+          cp "${{ matrix.file }}" mail.txt
+          python 365.py mail.txt
+
+      - name: Package per-job result (single file)
+        run: |
+          mkdir -p per_job_output
+          timestamp=$(date +'%Y%m%d_%H%M%S')
+          base=$(basename "${{ matrix.file }}" .txt)
+          outfile="per_job_output/success_results_${base}_${timestamp}.txt"
+          if [ -s success_results.txt ]; then
+            cp success_results.txt "$outfile"
           else
-            echo "❌ 没有找到 success_results.txt，跳过上传。"
-            exit 0
+            : > "$outfile"
           fi
+          echo "OUTFILE=$outfile" >> $GITHUB_ENV
+          echo "ARTIFACT_NAME=result-${base}-${timestamp}" >> $GITHUB_ENV
 
-      - name: 提交并 push success_xxx.txt 到仓库
+      - name: Upload per-job result
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.OUTFILE }}
+
+  collect-results:
+    needs: run-script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all per-job results
+        uses: actions/download-artifact@v4
+        with:
+          path: all_results
+
+      - name: Merge results and remove duplicates
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add outputs/
-          git commit -m "上传 success_results 时间戳文件" || echo "没有需要提交的更改"
+          mkdir -p merged_results
+          timestamp=$(date +'%Y%m%d_%H%M%S')
+          merged_file="merged_results/success_results_${timestamp}.txt"
+
+          find all_results -type f -name "success_results_*.txt" -size +0c -exec cat {} + | sort -u > "$merged_file" || true
+
+          echo "MERGED_FILE=$merged_file" >> $GITHUB_ENV
+          echo "MERGED_TS=$timestamp" >> $GITHUB_ENV
+
+      - name: Set merged artifact name
+        run: |
+          base=$(basename "${MERGED_FILE}")
+          echo "MERGED_ARTIFACT_NAME=merged-results-${base}" >> $GITHUB_ENV
+
+      - name: Commit merged results back
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add merged_results/
+          git commit -m "Add merged results with timestamp ${{ env.MERGED_TS }}" || echo "No changes to commit"
           git push
+
+      - name: Upload merged results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.MERGED_ARTIFACT_NAME }}
+          path: ${{ env.MERGED_FILE }}
